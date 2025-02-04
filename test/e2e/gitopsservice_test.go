@@ -39,7 +39,6 @@ import (
 	. "github.com/onsi/gomega"
 	osappsv1 "github.com/openshift/api/apps/v1"
 	configv1 "github.com/openshift/api/config/v1"
-	console "github.com/openshift/api/console/v1"
 	routev1 "github.com/openshift/api/route/v1"
 	templatev1 "github.com/openshift/api/template/v1"
 	pipelinesv1alpha1 "github.com/redhat-developer/gitops-operator/api/v1alpha1"
@@ -124,47 +123,13 @@ var _ = Describe("GitOpsServiceController", func() {
 		})
 	})
 
-	Context("Check if kam resources are created", func() {
-		name := "kam"
-		It("Deployment that hosts kam is created", func() {
-			checkIfPresent(types.NamespacedName{Name: name, Namespace: argoCDNamespace}, &appsv1.Deployment{})
-		})
-
-		It("Service that serves kam is created", func() {
-			checkIfPresent(types.NamespacedName{Name: name, Namespace: argoCDNamespace}, &corev1.Service{})
-		})
-
-		It("Console CLI download resource that adds kam route to OpenShift's CLI download page is created", func() {
-
-			By("route that serves kam is created")
-			route := &routev1.Route{}
-			checkIfPresent(types.NamespacedName{Name: name, Namespace: argoCDNamespace}, route)
-
-			By("CLI download link is created")
-			consoleCLIDownload := &console.ConsoleCLIDownload{}
-			checkIfPresent(types.NamespacedName{Name: name}, consoleCLIDownload)
-
-			By("CLI download link should match the kam route")
-			consoleCLILink := strings.TrimLeft(consoleCLIDownload.Spec.Links[0].Href, "https://")
-			Expect(route.Spec.Host + "/kam/").Should(Equal(consoleCLILink))
-		})
-	})
-
 	Context("Validate machine config updates", func() {
 		BeforeEach(func() {
 			imageYAML := filepath.Join("..", "appcrs", "image_appcr.yaml")
 			ocPath, err := exec.LookPath("oc")
 			Expect(err).NotTo(HaveOccurred())
 
-			// 'When GitOps operator is run locally (not installed via OLM), it does not correctly setup
-			// the 'argoproj.io' Role rules for the 'argocd-application-controller'
-			// Thus, applying missing rules for 'argocd-application-controller'
-			// TODO: Remove once https://github.com/redhat-developer/gitops-operator/issues/148 is fixed
-			err = applyMissingPermissions("openshift-gitops", "openshift-gitops")
-			Expect(err).NotTo(HaveOccurred())
-
-			cmd := exec.Command(ocPath, "apply", "-f", imageYAML)
-			err = cmd.Run()
+			_, _, err = runCommandWithOutput(ocPath, "apply", "-f", imageYAML)
 			Expect(err).NotTo(HaveOccurred())
 		})
 
@@ -225,8 +190,7 @@ var _ = Describe("GitOpsServiceController", func() {
 			nonDefaultAppCR := filepath.Join("..", "appcrs", "non_default_appcr.yaml")
 			ocPath, err := exec.LookPath("oc")
 			Expect(err).NotTo(HaveOccurred())
-			cmd := exec.Command(ocPath, "apply", "-f", nonDefaultAppCR)
-			_, err = cmd.CombinedOutput()
+			_, _, err = runCommandWithOutput(ocPath, "apply", "-f", nonDefaultAppCR)
 			if err != nil {
 				Expect(err).NotTo(HaveOccurred())
 			}
@@ -341,9 +305,6 @@ var _ = Describe("GitOpsServiceController", func() {
 			// 'When GitOps operator is run locally (not installed via OLM), it does not correctly setup
 			// the 'argoproj.io' Role rules for the 'argocd-application-controller'
 			// Thus, applying missing rules for 'argocd-application-controller'
-			// TODO: Remove once https://github.com/redhat-developer/gitops-operator/issues/148 is fixed
-			err := applyMissingPermissions("openshift-gitops", "openshift-gitops")
-			Expect(err).NotTo(HaveOccurred())
 
 			Eventually(func() error {
 				_, err := helper.ProjectExists("default", "openshift-gitops")
@@ -358,8 +319,7 @@ var _ = Describe("GitOpsServiceController", func() {
 			ocPath, err := exec.LookPath("oc")
 			Expect(err).NotTo(HaveOccurred())
 			schedulerYAML := filepath.Join("..", "appcrs", "scheduler_appcr.yaml")
-			cmd := exec.Command(ocPath, "apply", "-f", schedulerYAML)
-			_, err = cmd.CombinedOutput()
+			_, _, err = runCommandWithOutput(ocPath, "apply", "-f", schedulerYAML)
 			Expect(err).NotTo(HaveOccurred())
 
 			Eventually(func() error {
@@ -416,14 +376,6 @@ var _ = Describe("GitOpsServiceController", func() {
 				return nil
 			}, time.Minute*10, interval).ShouldNot(HaveOccurred())
 
-			// 'When GitOps operator is run locally (not installed via OLM), it does not correctly setup
-			// the 'argoproj.io' Role rules for the 'argocd-application-controller'
-			// Thus, applying missing rules for 'argocd-application-controller'
-			// TODO: Remove once https://github.com/redhat-developer/gitops-operator/issues/148 is fixed
-			if err := applyMissingPermissions(argocdInstance, sourceNS); err != nil {
-				Expect(err).NotTo(HaveOccurred())
-			}
-
 			// create a target namespace to deploy resources
 			// allow argocd to create resources in the target namespace by adding managed-by label
 			targetNamespaceObj := &corev1.Namespace{
@@ -465,8 +417,7 @@ var _ = Describe("GitOpsServiceController", func() {
 			nginxAppCr := filepath.Join("..", "appcrs", "nginx_appcr.yaml")
 			ocPath, err := exec.LookPath("oc")
 			Expect(err).NotTo(HaveOccurred())
-			cmd := exec.Command(ocPath, "apply", "-f", nginxAppCr)
-			err = cmd.Run()
+			_, _, err = runCommandWithOutput(ocPath, "apply", "-f", nginxAppCr)
 			Expect(err).NotTo(HaveOccurred())
 
 			Eventually(func() error {
@@ -491,13 +442,6 @@ var _ = Describe("GitOpsServiceController", func() {
 	Context("Validate permission label feature for OOTB Argo CD instance", func() {
 		argocdTargetNamespace := "argocd-target"
 		It("Create target namespace", func() {
-			// 'When GitOps operator is run locally (not installed via OLM), it does not correctly setup
-			// the 'argoproj.io' Role rules for the 'argocd-application-controller'
-			// Thus, applying missing rules for 'argocd-application-controller'
-			// TODO: Remove once https://github.com/redhat-developer/gitops-operator/issues/148 is fixed
-			err := applyMissingPermissions(argoCDInstanceName, argoCDNamespace)
-			Expect(err).NotTo(HaveOccurred())
-
 			// create a target namespace to deploy resources
 			// allow argocd to create resources in the target namespace by adding managed-by label
 			targetNamespaceObj := &corev1.Namespace{
@@ -508,7 +452,7 @@ var _ = Describe("GitOpsServiceController", func() {
 					},
 				},
 			}
-			err = k8sClient.Create(context.TODO(), targetNamespaceObj)
+			err := k8sClient.Create(context.TODO(), targetNamespaceObj)
 			if !kubeerrors.IsAlreadyExists(err) {
 				Expect(err).NotTo(HaveOccurred())
 			}
@@ -539,8 +483,7 @@ var _ = Describe("GitOpsServiceController", func() {
 			nginxAppCr := filepath.Join("..", "appcrs", "nginx_default_ns_appcr.yaml")
 			ocPath, err := exec.LookPath("oc")
 			Expect(err).NotTo(HaveOccurred())
-			cmd := exec.Command(ocPath, "apply", "-f", nginxAppCr)
-			err = cmd.Run()
+			_, _, err = runCommandWithOutput(ocPath, "apply", "-f", nginxAppCr)
 			Expect(err).NotTo(HaveOccurred())
 
 			Eventually(func() error {

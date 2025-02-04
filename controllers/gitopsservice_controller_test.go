@@ -37,7 +37,6 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	resourcev1 "k8s.io/apimachinery/pkg/api/resource"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -71,26 +70,62 @@ func TestImageFromEnvVariable(t *testing.T) {
 		}
 	})
 
-	t.Run("Kam Image present as env variable", func(t *testing.T) {
-		image := "quay.io/org/test"
-		t.Setenv(cliImageEnvName, image)
+}
 
-		deployment := newDeploymentForCLI()
+func TestReconcileDefaultForArgoCDNodeplacement(t *testing.T) {
+	logf.SetLogger(argocd.ZapLogger(true))
+	s := scheme.Scheme
+	addKnownTypesToScheme(s)
 
-		got := deployment.Spec.Template.Spec.Containers[0].Image
-		if got != image {
-			t.Errorf("Image mismatch: got %s, want %s", got, image)
-		}
-	})
-	t.Run("env variable for Kam image not found", func(t *testing.T) {
-		deployment := newDeploymentForCLI()
+	var err error
 
-		got := deployment.Spec.Template.Spec.Containers[0].Image
-		if got != cliImage {
-			t.Errorf("Image mismatch: got %s, want %s", got, cliImage)
-		}
-	})
+	gitopsService := &pipelinesv1alpha1.GitopsService{
+		ObjectMeta: v1.ObjectMeta{
+			Name: serviceName,
+		},
+		Spec: pipelinesv1alpha1.GitopsServiceSpec{
+			NodeSelector: map[string]string{
+				"foo": "bar",
+			},
+		},
+	}
 
+	fakeClient := fake.NewFakeClient(gitopsService)
+	reconciler := newReconcileGitOpsService(fakeClient, s)
+
+	existingArgoCD := &argoapp.ArgoCD{
+		ObjectMeta: v1.ObjectMeta{
+			Name:      serviceNamespace,
+			Namespace: serviceNamespace,
+		},
+		Spec: argoapp.ArgoCDSpec{
+			Server: argoapp.ArgoCDServerSpec{
+				Route: argoapp.ArgoCDRouteSpec{
+					Enabled: true,
+				},
+			},
+			ApplicationSet: &argoapp.ArgoCDApplicationSet{},
+			SSO: &argoapp.ArgoCDSSOSpec{
+				Provider: "dex",
+				Dex: &argoapp.ArgoCDDexSpec{
+					Config: "test-config",
+				},
+			},
+		},
+	}
+
+	err = fakeClient.Create(context.TODO(), existingArgoCD)
+	assertNoError(t, err)
+
+	_, err = reconciler.Reconcile(context.TODO(), newRequest("test", "test"))
+	assertNoError(t, err)
+
+	// verify whether existingArgoCD NodePlacement is updated when user is patching nodePlacement through GitopsService CR
+	err = fakeClient.Get(context.TODO(), types.NamespacedName{Name: common.ArgoCDInstanceName, Namespace: serviceNamespace},
+		existingArgoCD)
+	assertNoError(t, err)
+	assert.Check(t, existingArgoCD.Spec.NodePlacement != nil)
+	assert.DeepEqual(t, existingArgoCD.Spec.NodePlacement.NodeSelector, gitopsService.Spec.NodeSelector)
 }
 
 // If the DISABLE_DEFAULT_ARGOCD_INSTANCE is set, ensure that the default ArgoCD instance is not created.
@@ -442,53 +477,6 @@ func TestReconcile_BackendSecurityContext(t *testing.T) {
 	assert.DeepEqual(t, securityContext, want)
 }
 
-func TestReconcile_KamSecurityContext(t *testing.T) {
-	logf.SetLogger(argocd.ZapLogger(true))
-	s := scheme.Scheme
-	addKnownTypesToScheme(s)
-
-	util.SetConsoleAPIFound(true)
-	defer util.SetConsoleAPIFound(false)
-
-	// Testing on OCP versions < 4.11.0
-	fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(util.NewClusterVersion("4.12.1"), newGitopsService()).Build()
-	reconciler := newReconcileGitOpsService(fakeClient, s)
-
-	_, err := reconciler.Reconcile(context.TODO(), newRequest("test", "test"))
-	assertNoError(t, err)
-
-	deployment := appsv1.Deployment{}
-	err = fakeClient.Get(context.TODO(), types.NamespacedName{Name: cliName, Namespace: serviceNamespace}, &deployment)
-	assertNoError(t, err)
-
-	// Testing on OCP versions < 4.11.0
-
-	fakeClient = fake.NewClientBuilder().WithScheme(s).WithObjects(util.NewClusterVersion("4.12.1"), newGitopsService()).Build()
-	reconciler = newReconcileGitOpsService(fakeClient, s)
-
-	_, err = reconciler.Reconcile(context.TODO(), newRequest("test", "test"))
-	assertNoError(t, err)
-
-	deployment = appsv1.Deployment{}
-	err = fakeClient.Get(context.TODO(), types.NamespacedName{Name: cliName, Namespace: serviceNamespace}, &deployment)
-	assertNoError(t, err)
-
-	securityContext := deployment.Spec.Template.Spec.Containers[0].SecurityContext
-	want := &corev1.SecurityContext{
-		AllowPrivilegeEscalation: util.BoolPtr(false),
-		Capabilities: &corev1.Capabilities{
-			Drop: []corev1.Capability{
-				"ALL",
-			},
-		},
-		RunAsNonRoot: util.BoolPtr(true),
-		SeccompProfile: &corev1.SeccompProfile{
-			Type: corev1.SeccompProfileTypeRuntimeDefault,
-		},
-	}
-	assert.DeepEqual(t, securityContext, want)
-}
-
 func TestReconcile_testArgoCDForOperatorUpgrade(t *testing.T) {
 	logf.SetLogger(argocd.ZapLogger(true))
 	s := scheme.Scheme
@@ -553,14 +541,15 @@ func TestReconcile_VerifyResourceQuotaDeletionForUpgrade(t *testing.T) {
 
 	// Create namespace object for default ArgoCD instance and set resource quota to it.
 	defaultArgoNS := &corev1.Namespace{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: serviceNamespace,
+		ObjectMeta: v1.ObjectMeta{
+			Name:      serviceNamespace,
+			Namespace: serviceNamespace,
 		},
 	}
 	fakeClient.Create(context.TODO(), defaultArgoNS)
 
 	dummyResourceObj := &corev1.ResourceQuota{
-		ObjectMeta: metav1.ObjectMeta{
+		ObjectMeta: v1.ObjectMeta{
 			Name:      fmt.Sprintf("%s-compute-resources", serviceNamespace),
 			Namespace: serviceNamespace,
 		},
@@ -613,7 +602,7 @@ func TestReconcile_InfrastructureNode(t *testing.T) {
 	s := scheme.Scheme
 	addKnownTypesToScheme(s)
 	gitopsService := &pipelinesv1alpha1.GitopsService{
-		ObjectMeta: metav1.ObjectMeta{
+		ObjectMeta: v1.ObjectMeta{
 			Name: serviceName,
 		},
 		Spec: pipelinesv1alpha1.GitopsServiceSpec{
@@ -642,6 +631,110 @@ func TestReconcile_InfrastructureNode(t *testing.T) {
 	assert.DeepEqual(t, argoCD.Spec.NodePlacement.NodeSelector, common.InfraNodeSelector())
 	assert.DeepEqual(t, argoCD.Spec.NodePlacement.Tolerations, deploymentDefaultTolerations())
 
+}
+
+func TestReconcile_PSSLabels(t *testing.T) {
+	logf.SetLogger(argocd.ZapLogger(true))
+	s := scheme.Scheme
+	addKnownTypesToScheme(s)
+
+	testCases := []struct {
+		name      string
+		namespace string
+		labels    map[string]string
+	}{
+		{
+			name:      "modified valid PSS labels for openshift-gitops ns",
+			namespace: "openshift-gitops",
+			labels: map[string]string{
+				"pod-security.kubernetes.io/enforce":         "privileged",
+				"pod-security.kubernetes.io/enforce-version": "v1.30",
+				"pod-security.kubernetes.io/audit":           "privileged",
+				"pod-security.kubernetes.io/audit-version":   "v1.29",
+				"pod-security.kubernetes.io/warn":            "privileged",
+				"pod-security.kubernetes.io/warn-version":    "v1.29",
+			},
+		},
+		{
+			name:      "modified invalid and empty PSS labels for openshift-gitops ns",
+			namespace: "openshift-gitops",
+			labels: map[string]string{
+				"pod-security.kubernetes.io/enforce":         "invalid",
+				"pod-security.kubernetes.io/enforce-version": "invalid",
+				"pod-security.kubernetes.io/warn":            "invalid",
+				"pod-security.kubernetes.io/warn-version":    "invalid",
+			},
+		},
+	}
+
+	expected_labels := map[string]string{
+		"pod-security.kubernetes.io/enforce":         "restricted",
+		"pod-security.kubernetes.io/enforce-version": "v1.29",
+		"pod-security.kubernetes.io/audit":           "restricted",
+		"pod-security.kubernetes.io/audit-version":   "latest",
+		"pod-security.kubernetes.io/warn":            "restricted",
+		"pod-security.kubernetes.io/warn-version":    "latest",
+	}
+
+	fakeClient := fake.NewFakeClient(util.NewClusterVersion("4.7.1"), newGitopsService())
+	reconciler := newReconcileGitOpsService(fakeClient, s)
+
+	_, err := reconciler.Reconcile(context.TODO(), newRequest("test", "test"))
+	assertNoError(t, err)
+
+	// Create a user defined namespace
+	testNS := newRestrictedNamespace("test")
+	err = fakeClient.Create(context.TODO(), testNS)
+	assertNoError(t, err)
+
+	// Create an ArgoCD instance in the user defined namespace
+	testArgoCD := &argoapp.ArgoCD{
+		ObjectMeta: v1.ObjectMeta{
+			Name:      "test",
+			Namespace: "test",
+		},
+		Spec: argoapp.ArgoCDSpec{},
+	}
+	err = fakeClient.Create(context.TODO(), testArgoCD)
+	assertNoError(t, err)
+
+	_, err = reconciler.Reconcile(context.TODO(), newRequest("test", "test"))
+	assertNoError(t, err)
+
+	// Check if PSS labels are addded to the user defined ns
+	reconciled_ns := &corev1.Namespace{}
+	err = fakeClient.Get(context.TODO(), types.NamespacedName{Name: "test"},
+		reconciled_ns)
+	assertNoError(t, err)
+
+	for label, _ := range reconciled_ns.ObjectMeta.Labels {
+		_, found := expected_labels[label]
+		// Fail if label is found
+		assert.Check(t, found != true)
+	}
+
+	for _, tc := range testCases {
+		existing_ns := &corev1.Namespace{}
+		assert.NilError(t, fakeClient.Get(context.TODO(), types.NamespacedName{Name: tc.namespace}, existing_ns), err)
+
+		// Assign new values, confirm the assignment and update the PSS labels
+		existing_ns.ObjectMeta.Labels = tc.labels
+		fakeClient.Update(context.TODO(), existing_ns)
+		assert.NilError(t, fakeClient.Get(context.TODO(), types.NamespacedName{Name: tc.namespace}, existing_ns), err)
+		assert.DeepEqual(t, existing_ns.ObjectMeta.Labels, tc.labels)
+
+		_, err := reconciler.Reconcile(context.TODO(), newRequest("test", "test"))
+		assertNoError(t, err)
+
+		assert.NilError(t, fakeClient.Get(context.TODO(), types.NamespacedName{Name: tc.namespace}, reconciled_ns), err)
+
+		for key, value := range expected_labels {
+			label, found := reconciled_ns.ObjectMeta.Labels[key]
+			// Fail if label is not found, comapre the values with the expected values if found
+			assert.Check(t, found)
+			assert.Equal(t, label, value)
+		}
+	}
 }
 
 func addKnownTypesToScheme(scheme *runtime.Scheme) {

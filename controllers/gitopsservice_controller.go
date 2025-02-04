@@ -50,6 +50,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -106,6 +107,13 @@ func (r *ReconcileGitopsService) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&appsv1.Deployment{}, builder.WithPredicates(pred)).
 		Owns(&corev1.Service{}, builder.WithPredicates(pred)).
 		Owns(&routev1.Route{}, builder.WithPredicates(pred)).
+		Watches(
+			&corev1.Namespace{},
+			&handler.EnqueueRequestForObject{},
+			builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
+				return obj.GetName() == "openshift-gitops"
+			})),
+		).
 		Complete(r)
 }
 
@@ -155,7 +163,7 @@ type ReconcileGitopsService struct {
 
 //+kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;delete;patch;update
 //+kubebuilder:rbac:groups=batch,resources=cronjobs;jobs,verbs=get;list;watch;create;delete;patch;update
-//+kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;create;delete;patch;update
+//+kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses;networkpolicies,verbs=get;list;watch;create;delete;patch;update
 
 //+kubebuilder:rbac:groups=operators.coreos.com,resources=operatorgroups;subscriptions;clusterserviceversions,verbs=create;get;list;watch
 
@@ -188,6 +196,9 @@ type ReconcileGitopsService struct {
 //+kubebuilder:rbac:groups="split.smi-spec.io",resources=trafficsplits,verbs=create;watch;get;update;patch
 //+kubebuilder:rbac:groups="traefik.containo.us",resources=traefikservices,verbs=watch;get;update
 //+kubebuilder:rbac:groups="x.getambassador.io",resources=ambassadormappings;mappings,verbs=create;watch;get;update;list;delete
+//+kubebuilder:rbac:groups=argoproj.io,resources=notificationsconfigurations;notificationsconfigurations/finalizers,verbs=*
+//+kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch;
+//+kubebuilder:rbac:groups="apiregistration.k8s.io",resources="apiservices",verbs=get;list
 
 // Reconcile reads that state of the cluster for a GitopsService object and makes changes based on the state read
 // and what is in the GitopsService.Spec
@@ -215,8 +226,8 @@ func (r *ReconcileGitopsService) Reconcile(ctx context.Context, request reconcil
 	}
 
 	// Create namespace if it doesn't already exist
-	namespaceRef := newNamespace(namespace)
-	err = r.Client.Get(ctx, types.NamespacedName{Name: namespace}, &corev1.Namespace{})
+	namespaceRef := newRestrictedNamespace(namespace)
+	err = r.Client.Get(ctx, types.NamespacedName{Name: namespace}, namespaceRef)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			reqLogger.Info("Creating a new Namespace", "Name", namespace)
@@ -226,6 +237,14 @@ func (r *ReconcileGitopsService) Reconcile(ctx context.Context, request reconcil
 			}
 		} else {
 			return reconcile.Result{}, err
+		}
+	} else {
+		needsUpdate, updateNameSpace := ensurePodSecurityLabels(namespaceRef)
+		if needsUpdate {
+			err = r.Client.Update(context.TODO(), updateNameSpace)
+			if err != nil {
+				return reconcile.Result{}, err
+			}
 		}
 	}
 
@@ -248,10 +267,6 @@ func (r *ReconcileGitopsService) Reconcile(ctx context.Context, request reconcil
 	}
 
 	if result, err := r.reconcileBackend(gitopsserviceNamespacedName, instance, reqLogger); err != nil {
-		return result, err
-	}
-
-	if result, err := r.reconcileCLIServer(instance, request); err != nil {
 		return result, err
 	}
 
@@ -298,7 +313,7 @@ func (r *ReconcileGitopsService) ensureDefaultArgoCDInstanceDoesntExist(instance
 		return err
 	}
 
-	argocdNS := newNamespace(defaultArgoCDInstance.Namespace)
+	argocdNS := newRestrictedNamespace(defaultArgoCDInstance.Namespace)
 	err = r.Client.Get(context.TODO(), types.NamespacedName{Name: argocdNS.Name}, &corev1.Namespace{})
 	if err != nil {
 
@@ -337,8 +352,8 @@ func (r *ReconcileGitopsService) reconcileDefaultArgoCDInstance(instance *pipeli
 	// The operator decides the namespace based on the version of the cluster it is installed in
 	// 4.6 Cluster: Backend in openshift-pipelines-app-delivery namespace and argocd in openshift-gitops namespace
 	// 4.7 Cluster: Both backend and argocd instance in openshift-gitops namespace
-	argocdNS := newNamespace(defaultArgoCDInstance.Namespace)
-	err = r.Client.Get(context.TODO(), types.NamespacedName{Name: argocdNS.Name}, &corev1.Namespace{})
+	argocdNS := newRestrictedNamespace(defaultArgoCDInstance.Namespace)
+	err = r.Client.Get(context.TODO(), types.NamespacedName{Name: argocdNS.Name}, argocdNS)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			reqLogger.Info("Creating a new Namespace", "Name", argocdNS.Name)
@@ -370,6 +385,15 @@ func (r *ReconcileGitopsService) reconcileDefaultArgoCDInstance(instance *pipeli
 				return reconcile.Result{}, err
 			}
 		}
+
+		needsUpdate, updateNameSpace := ensurePodSecurityLabels(argocdNS)
+		if needsUpdate {
+			err = r.Client.Update(context.TODO(), updateNameSpace)
+			if err != nil {
+				return reconcile.Result{}, err
+			}
+		}
+
 	}
 
 	// Set GitopsService instance as the owner and controller
@@ -421,7 +445,6 @@ func (r *ReconcileGitopsService) reconcileDefaultArgoCDInstance(instance *pipeli
 		}
 	} else {
 		changed := false
-
 		if existingArgoCD.Spec.ApplicationSet != nil {
 			if existingArgoCD.Spec.ApplicationSet.Resources == nil {
 				existingArgoCD.Spec.ApplicationSet.Resources = defaultArgoCDInstance.Spec.ApplicationSet.Resources
@@ -470,7 +493,14 @@ func (r *ReconcileGitopsService) reconcileDefaultArgoCDInstance(instance *pipeli
 			changed = true
 		}
 
-		if !reflect.DeepEqual(existingArgoCD.Spec.NodePlacement, defaultArgoCDInstance.Spec.NodePlacement) {
+		// if user is patching nodePlacement through GitopsService CR, then existingArgoCD NodePlacement is updated.
+		if defaultArgoCDInstance.Spec.NodePlacement != nil {
+			if !reflect.DeepEqual(existingArgoCD.Spec.NodePlacement, defaultArgoCDInstance.Spec.NodePlacement) {
+				existingArgoCD.Spec.NodePlacement = defaultArgoCDInstance.Spec.NodePlacement
+				changed = true
+			}
+			// Handle the case where NodePlacement should be removed
+		} else if existingArgoCD.Spec.NodePlacement != nil {
 			existingArgoCD.Spec.NodePlacement = defaultArgoCDInstance.Spec.NodePlacement
 			changed = true
 		}
@@ -760,6 +790,10 @@ func newBackendDeployment(ns types.NamespacedName) *appsv1.Deployment {
 		ObjectMeta: metav1.ObjectMeta{
 			Labels: map[string]string{
 				"app.kubernetes.io/name": ns.Name,
+
+				// restricted-v2 pinning is recommended for openshift workloads
+				// This SCC mutates the Pod Spec to pass PSA's restricted policy.
+				"openshift.io/required-scc": "restricted-v2",
 			},
 		},
 		Spec: podSpec,
@@ -809,7 +843,7 @@ func newBackendService(ns types.NamespacedName) *corev1.Service {
 	return svc
 }
 
-func newNamespace(ns string) *corev1.Namespace {
+func newRestrictedNamespace(ns string) *corev1.Namespace {
 	objectMeta := metav1.ObjectMeta{
 		Name: ns,
 		Labels: map[string]string{
@@ -817,6 +851,18 @@ func newNamespace(ns string) *corev1.Namespace {
 			"openshift.io/cluster-monitoring": "true",
 		},
 	}
+
+	if strings.HasPrefix(ns, "openshift-") {
+		// Set pod security policy, which is required for namespaces pre-fixed with openshift
+		// as the pod security label syncer doesn't set them on OCP namespaces.
+		objectMeta.Labels["pod-security.kubernetes.io/enforce"] = "restricted"
+		objectMeta.Labels["pod-security.kubernetes.io/enforce-version"] = "v1.29"
+		objectMeta.Labels["pod-security.kubernetes.io/audit"] = "restricted"
+		objectMeta.Labels["pod-security.kubernetes.io/audit-version"] = "latest"
+		objectMeta.Labels["pod-security.kubernetes.io/warn"] = "restricted"
+		objectMeta.Labels["pod-security.kubernetes.io/warn-version"] = "latest"
+	}
+
 	return &corev1.Namespace{
 		ObjectMeta: objectMeta,
 	}
@@ -898,4 +944,26 @@ func policyRuleForBackendServiceClusterRole() []rbacv1.PolicyRule {
 			},
 		},
 	}
+}
+
+func ensurePodSecurityLabels(namespace *corev1.Namespace) (bool, *corev1.Namespace) {
+
+	pssLabels := map[string]string{
+		"pod-security.kubernetes.io/enforce":         "restricted",
+		"pod-security.kubernetes.io/enforce-version": "v1.29",
+		"pod-security.kubernetes.io/audit":           "restricted",
+		"pod-security.kubernetes.io/audit-version":   "latest",
+		"pod-security.kubernetes.io/warn":            "restricted",
+		"pod-security.kubernetes.io/warn-version":    "latest",
+	}
+
+	changed := false
+	for pssKey, pssVal := range pssLabels {
+		if nsVal, exists := namespace.Labels[pssKey]; !exists || nsVal != pssVal {
+			namespace.Labels[pssKey] = pssVal
+			changed = true
+		}
+
+	}
+	return changed, namespace
 }
